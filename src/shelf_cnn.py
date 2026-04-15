@@ -25,83 +25,140 @@ import matplotlib.pyplot as plt
 DATA_FILENAME = "shelf_images.npz"
 CLASS_NAMES = ["normal", "damaged", "overloaded"]
 
+IMG_SIZE = 64
+SHELF_THICKNESS = 5
+BOX_REGION_TOP = 4
+BG_BRIGHTNESS = 0.12
+SHELF_BRIGHTNESS = 0.75
+
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def generate_shelf_image(label: int, image_size: int = 64, noise_std: float = 0.08) -> np.ndarray:
-    """Generate one synthetic shelf image for the given label."""
-    rng = np.random.default_rng()
-    canvas = np.ones((image_size, image_size), dtype=np.float32)
+def denormalize_tensor(image: torch.Tensor, mean: float = 0.5, std: float = 0.5) -> np.ndarray:
+    image = image * std + mean
+    return image.clamp(0.0, 1.0).cpu().numpy()
 
-    # Shelf bar properties.
-    bar_height = 6
-    shelf_y = image_size // 2 + rng.integers(-4, 5)
-    shelf_y = np.clip(shelf_y, 16, image_size - 20)
-    bar_brightness = 0.45 + rng.uniform(-0.08, 0.08)
-    canvas[shelf_y : shelf_y + bar_height, :] = bar_brightness
 
-    def draw_boxes(count: int, min_width: int, max_width: int, min_height: int, max_height: int, density: float = 0.7) -> None:
-        x = 4
-        while x < image_size - 12 and count > 0:
-            width = rng.integers(min_width, max_width + 1)
-            height = rng.integers(min_height, max_height + 1)
-            y = shelf_y - height
-            x += rng.integers(0, 4)
-            x_end = min(image_size - 4, x + width)
-            if x_end - x < 8:
-                break
-            color = 0.20 + rng.uniform(-0.05, 0.10)
-            canvas[max(0, y) : shelf_y - 2, x:x_end] = np.clip(color + rng.normal(0, 0.03), 0.0, 1.0)
-            x = x_end + rng.integers(2, 6)
-            count -= 1
+def _draw_shelf(img: np.ndarray, rng: np.random.Generator) -> int:
+    shelf_top = _random_shelf_top(rng)
+    shelf_bottom = shelf_top + SHELF_THICKNESS
+    img[shelf_top:shelf_bottom, :] = SHELF_BRIGHTNESS
 
-    if label == 0:
-        draw_boxes(count=4, min_width=12, max_width=18, min_height=14, max_height=22)
-    elif label == 1:
-        draw_boxes(count=3, min_width=12, max_width=18, min_height=14, max_height=22)
-        crack_x = rng.integers(12, image_size - 12)
-        crack_y1 = shelf_y + 1
-        crack_y2 = min(image_size - 1, shelf_y + rng.integers(12, 22))
-        for dy in range(crack_y2 - crack_y1):
-            x = crack_x + rng.integers(-1, 2)
-            y = crack_y1 + dy
-            if 0 <= x < image_size and 0 <= y < image_size:
-                canvas[y, x] = 0.0
-        if rng.random() < 0.5:
-            damaged_box_x = rng.integers(16, image_size - 20)
-            damaged_box_w = rng.integers(10, 16)
-            damaged_box_h = rng.integers(10, 18)
-            damaged_box_y = shelf_y - damaged_box_h
-            canvas[damaged_box_y:shelf_y - 2, damaged_box_x:damaged_box_x + damaged_box_w] = 0.0
-    else:
-        draw_boxes(count=6, min_width=10, max_width=16, min_height=18, max_height=28)
-        overfill = rng.integers(2, 4)
-        for _ in range(overfill):
-            box_w = rng.integers(8, 14)
-            box_h = rng.integers(10, 18)
-            x = rng.integers(4, image_size - box_w - 4)
-            y = rng.integers(max(2, shelf_y - box_h - 8), shelf_y - 6)
-            color = 0.18 + rng.uniform(-0.05, 0.05)
-            canvas[y : y + box_h, x : x + box_w] = np.clip(color + rng.normal(0, 0.03), 0.0, 1.0)
+    n_dividers = rng.integers(2, 5)
+    for _ in range(n_dividers):
+        x = rng.integers(8, IMG_SIZE - 8)
+        img[shelf_top:shelf_bottom, x] = rng.uniform(0.25, 0.40)
 
-    noise = rng.normal(0.0, noise_std, size=canvas.shape).astype(np.float32)
-    image = np.clip(canvas + noise, 0.0, 1.0)
-    return image
+    return shelf_top
+
+
+def _draw_boxes(img: np.ndarray, shelf_top: int, n_boxes: int, max_height: int, rng: np.random.Generator) -> None:
+    for _ in range(n_boxes):
+        bw = rng.integers(4, 14)
+        bh = rng.integers(4, max_height + 1)
+        bx = rng.integers(1, IMG_SIZE - bw - 1)
+        by_bottom = shelf_top
+        by_top = max(BOX_REGION_TOP, shelf_top - bh)
+        brightness = rng.uniform(0.30, 0.55)
+        img[by_top:by_bottom, bx:bx + bw] = brightness
+
+        border = brightness * 0.65
+        img[by_top:by_bottom, bx] = border
+        img[by_top:by_bottom, bx + bw - 1] = border
+
+
+def _draw_crack(img: np.ndarray, shelf_top: int, rng: np.random.Generator) -> None:
+    shelf_bottom = shelf_top + SHELF_THICKNESS
+    x0 = rng.integers(2, IMG_SIZE // 2)
+    y0 = shelf_top + rng.integers(1, SHELF_THICKNESS - 1)
+    angle = rng.uniform(-0.3, 0.3)
+    length = rng.integers(15, 45)
+
+    for t in range(int(length)):
+        x = int(x0 + t * np.cos(angle))
+        y = int(y0 + t * np.sin(angle))
+        if 0 <= x < IMG_SIZE and shelf_top <= y < shelf_bottom:
+            img[y, x] = rng.uniform(0.0, 0.15)
+            if y + 1 < shelf_bottom:
+                img[y + 1, x] = rng.uniform(0.0, 0.20)
+
+
+def _box_area_fraction(img: np.ndarray, shelf_top: int) -> float:
+    region = img[BOX_REGION_TOP:shelf_top, :]
+    return float((region > 0.25).mean())
+
+
+def _random_shelf_top(rng: np.random.Generator) -> int:
+    return 48 + rng.integers(-4, 5)
+
+
+def _add_noise(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    img = img + rng.uniform(-0.04, 0.04, size=img.shape)
+    img = img + rng.normal(0.0, 0.04, size=img.shape)
+    return np.clip(img, 0.0, 1.0)
+
+
+def generate_normal(rng: np.random.Generator) -> np.ndarray:
+    img = np.full((IMG_SIZE, IMG_SIZE), BG_BRIGHTNESS, dtype=np.float32)
+    shelf_top = _draw_shelf(img, rng)
+    _draw_boxes(img, shelf_top, n_boxes=rng.integers(2, 5), max_height=15, rng=rng)
+
+    attempts = 0
+    while _box_area_fraction(img, shelf_top) > 0.25 and attempts < 10:
+        img[BOX_REGION_TOP:shelf_top, :] = BG_BRIGHTNESS
+        _draw_boxes(img, shelf_top, n_boxes=rng.integers(2, 4), max_height=12, rng=rng)
+        attempts += 1
+
+    return _add_noise(img, rng)
+
+
+def generate_damaged(rng: np.random.Generator) -> np.ndarray:
+    img = np.full((IMG_SIZE, IMG_SIZE), BG_BRIGHTNESS, dtype=np.float32)
+    shelf_top = _draw_shelf(img, rng)
+    _draw_boxes(img, shelf_top, n_boxes=rng.integers(2, 5), max_height=15, rng=rng)
+    _draw_crack(img, shelf_top, rng)
+
+    attempts = 0
+    while _box_area_fraction(img, shelf_top) > 0.25 and attempts < 10:
+        img[BOX_REGION_TOP:shelf_top, :] = BG_BRIGHTNESS
+        _draw_boxes(img, shelf_top, n_boxes=rng.integers(2, 4), max_height=12, rng=rng)
+        attempts += 1
+
+    return _add_noise(img, rng)
+
+
+def generate_overloaded(rng: np.random.Generator) -> np.ndarray:
+    img = np.full((IMG_SIZE, IMG_SIZE), BG_BRIGHTNESS, dtype=np.float32)
+    shelf_top = _draw_shelf(img, rng)
+    _draw_boxes(img, shelf_top, n_boxes=rng.integers(6, 10), max_height=35, rng=rng)
+
+    attempts = 0
+    while _box_area_fraction(img, shelf_top) < 0.45 and attempts < 20:
+        _draw_boxes(img, shelf_top, n_boxes=rng.integers(2, 4), max_height=30, rng=rng)
+        attempts += 1
+
+    return _add_noise(img, rng)
 
 
 def generate_shelf_dataset(path: Path, n_per_class: int = 300, seed: int = 42) -> None:
-    """Generate and save the synthetic shelf dataset."""
     rng = np.random.default_rng(seed)
-    images = np.zeros((n_per_class * len(CLASS_NAMES), 64, 64), dtype=np.float32)
-    labels = np.zeros((n_per_class * len(CLASS_NAMES),), dtype=np.int64)
+    generators = [generate_normal, generate_damaged, generate_overloaded]
+    images = []
+    labels = []
 
-    for label in range(len(CLASS_NAMES)):
-        for idx in range(n_per_class):
-            i = label * n_per_class + idx
-            images[i] = generate_shelf_image(label)
-            labels[i] = label
+    for class_idx, generator in enumerate(generators):
+        for _ in range(n_per_class):
+            images.append(generator(rng))
+            labels.append(class_idx)
+
+    images = np.array(images, dtype=np.float32)
+    labels = np.array(labels, dtype=np.int64)
+
+    indices = rng.permutation(len(images))
+    images = images[indices]
+    labels = labels[indices]
 
     save_path = path / DATA_FILENAME
     np.savez_compressed(save_path, images=images, labels=labels, class_names=np.array(CLASS_NAMES, dtype=object))
@@ -158,6 +215,22 @@ class ShelfCNN(nn.Module):
         return self.classifier(x)
 
 
+class ShelfFC(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(IMG_SIZE * IMG_SIZE, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, len(CLASS_NAMES)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class ResNetTransfer(nn.Module):
     def __init__(self, pretrained: bool = True, freeze_backbone: bool = False):
         super().__init__()
@@ -190,17 +263,13 @@ def make_dataloaders(images: np.ndarray, labels: np.ndarray, batch_size: int, au
     if augment:
         train_transform = [
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(10, fill=255),
+            transforms.RandomRotation(10, fill=0),
             transforms.ColorJitter(brightness=0.25),
             transforms.ToTensor(),
         ]
     val_transform = [transforms.ToTensor()]
 
-    if transfer_learning:
-        normalization = transforms.Normalize(mean=[0.5], std=[0.5])
-    else:
-        normalization = transforms.Normalize(mean=[0.5], std=[0.5])
-
+    normalization = transforms.Normalize(mean=[0.5], std=[0.5])
     train_transform.append(normalization)
     val_transform.append(normalization)
 
@@ -398,7 +467,7 @@ def save_example_predictions(
             preds = logits.argmax(dim=1).cpu().numpy()
             y_np = y.numpy()
             for i in range(X.size(0)):
-                image = X[i].cpu().squeeze(0).numpy()
+                image = denormalize_tensor(X[i].cpu().squeeze(0))
                 label = int(y_np[i])
                 pred = int(preds[i])
                 examples.append((image, label, pred))
@@ -478,10 +547,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay for Adam optimizer")
     parser.add_argument("--dropout", type=float, default=0.5, help="Dropout probability after the fully connected layer")
-    parser.add_argument("--no-batchnorm", action="store_true", help="Disable batch normalization")
+    parser.add_argument("--model", choices=["cnn", "fc", "transfer"], default="cnn", help="Model type to train")
+    parser.add_argument("--no-batchnorm", action="store_true", help="Disable batch normalization for the custom CNN")
     parser.add_argument("--no-augmentation", action="store_true", help="Disable training data augmentation")
     parser.add_argument("--patience", type=int, default=15, help="Early stopping patience")
-    parser.add_argument("--transfer-learning", action="store_true", help="Use pretrained ResNet-18 instead of the custom CNN")
     parser.add_argument("--freeze-backbone", action="store_true", help="Freeze pretrained ResNet backbone when using transfer learning")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for dataset split and generation")
     return parser.parse_args()
@@ -507,10 +576,12 @@ def run_training(args: argparse.Namespace) -> None:
         labels,
         batch_size=args.batch_size,
         augment=not args.no_augmentation,
-        transfer_learning=args.transfer_learning,
+        transfer_learning=args.model == "transfer",
     )
 
-    if args.transfer_learning:
+    if args.model == "fc":
+        model = ShelfFC()
+    elif args.model == "transfer":
         model = ResNetTransfer(pretrained=True, freeze_backbone=args.freeze_backbone)
     else:
         model = ShelfCNN(use_batchnorm=not args.no_batchnorm, dropout_p=args.dropout)
@@ -527,7 +598,7 @@ def run_training(args: argparse.Namespace) -> None:
         output_dir=output_dir,
     )
 
-    plot_history(history, output_dir / "training_history.png")
+    plot_history(history, output_dir / f"training_history_{args.model}.png")
 
     test_loss, test_acc = evaluate_model(model, test_loader, device)
     print(f"Test set: loss={test_loss:.4f} accuracy={test_acc:.4f}")
@@ -536,15 +607,15 @@ def run_training(args: argparse.Namespace) -> None:
     report = classification_report(targets, preds, target_names=class_names, digits=4)
     print("\nClassification report:\n", report)
     cm = confusion_matrix(targets, preds)
-    plot_confusion_matrix(cm, class_names, output_dir / "confusion_matrix.png")
+    plot_confusion_matrix(cm, class_names, output_dir / f"confusion_matrix_{args.model}.png")
 
     test_examples = Subset(ShelfImageDataset(images, labels, transform=transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5], std=[0.5]),
     ])), test_idx)
-    save_example_predictions(model, test_examples, device, output_dir / "example_predictions.png")
+    save_example_predictions(model, test_examples, device, output_dir / f"example_predictions_{args.model}.png")
 
-    if not args.transfer_learning:
+    if args.model == "cnn":
         visualize_first_layer_filters(model, output_dir / "first_layer_filters.png")
 
     print("Done. Outputs are available in:", output_dir)
